@@ -86,7 +86,9 @@ func (r *AEADChunkReader) Read(p []byte) (n int, err error) {
 	if err != nil {
 		return
 	}
-	_, err = io.CopyN(io.Discard, r.upstream, int64(paddingLen))
+	if paddingLen > 0 {
+		_, err = io.CopyN(io.Discard, r.upstream, int64(paddingLen))
+	}
 	return
 }
 

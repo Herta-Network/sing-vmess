@@ -2,8 +2,11 @@ package vmess
 
 import (
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
+	"sync"
+	"sync/atomic"
 
 	"github.com/metacubex/sing/common"
 	"github.com/metacubex/sing/common/buf"
@@ -17,9 +20,15 @@ type XUDPConn struct {
 	net.Conn
 	writer          N.ExtendedWriter
 	destination     M.Socksaddr
-	requestWritten  bool
+	requestWritten  atomic.Bool
 	globalID        [8]byte
 	readWaitOptions N.ReadWaitOptions
+	readAccess      sync.Mutex
+	writeAccess     sync.Mutex
+	readErr         error
+	writeErr        error
+	readScratch     [256]byte
+	metadataReader  io.LimitedReader
 }
 
 func NewXUDPConn(conn net.Conn, globalID [8]byte, destination M.Socksaddr) *XUDPConn {
@@ -40,155 +49,155 @@ func (c *XUDPConn) Write(p []byte) (n int, err error) {
 	return c.WriteTo(p, c.destination)
 }
 
-func (c *XUDPConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
-	buffer := buf.With(p)
-	var destination M.Socksaddr
-	destination, err = c.ReadPacket(buffer)
+func (c *XUDPConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	c.readAccess.Lock()
+	defer c.readAccess.Unlock()
+	length, destination, err := c.readPacketHeader()
 	if err != nil {
-		return
+		return 0, nil, err
+	}
+	if len(p) < length {
+		return 0, nil, c.discardPayload(length)
+	}
+	n, err := io.ReadFull(c.Conn, p[:length])
+	if err != nil {
+		c.readErr = err
+		return n, nil, err
 	}
 	if destination.IsFqdn() {
-		addr = destination
-	} else {
-		addr = destination.UDPAddr()
+		return n, destination, nil
 	}
-	n = buffer.Len()
-	return
+	return n, destination.UDPAddr(), nil
 }
 
-func (c *XUDPConn) ReadPacket(buffer *buf.Buffer) (destination M.Socksaddr, err error) {
-	start := buffer.Start()
-	_, err = buffer.ReadFullFrom(c.Conn, 6)
+func (c *XUDPConn) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
+	c.readAccess.Lock()
+	defer c.readAccess.Unlock()
+	length, destination, err := c.readPacketHeader()
 	if err != nil {
-		return
+		return M.Socksaddr{}, err
 	}
-	var length uint16
-	err = binary.Read(buffer, binary.BigEndian, &length)
-	if err != nil {
-		return
+	if buffer.FreeLen() < length {
+		return M.Socksaddr{}, c.discardPayload(length)
 	}
-	header, err := buffer.ReadBytes(4)
-	if err != nil {
-		return
+	if _, err := buffer.ReadFullFrom(c.Conn, length); err != nil {
+		c.readErr = err
+		return M.Socksaddr{}, err
 	}
-	switch header[2] {
-	case StatusNew:
-		return M.Socksaddr{}, E.New("unexpected frame new")
-	case StatusKeep:
-		if length != 4 {
-			_, err = buffer.ReadFullFrom(c.Conn, int(length)-2)
-			if err != nil {
-				return
-			}
-			buffer.Advance(1)
-			destination, err = AddressSerializer.ReadAddrPort(buffer)
-			if err != nil {
-				return
-			}
-			destination = destination.Unwrap()
-		} else {
-			_, err = buffer.ReadFullFrom(c.Conn, 2)
-			if err != nil {
-				return
-			}
-			destination = c.destination
-		}
-	case StatusEnd:
-		return M.Socksaddr{}, io.EOF
-	case StatusKeepAlive:
-	default:
-		return M.Socksaddr{}, E.New("unexpected frame: ", buffer.Byte(2))
-	}
-	// option error
-	if header[3]&2 == 2 {
-		return M.Socksaddr{}, E.Cause(net.ErrClosed, "remote closed")
-	}
-	// option data
-	if header[3]&1 != 1 {
-		buffer.Resize(start, 0)
-		return c.ReadPacket(buffer)
-	} else {
-		err = binary.Read(buffer, binary.BigEndian, &length)
-		if err != nil {
-			return
-		}
-		buffer.Resize(start, 0)
-		_, err = buffer.ReadFullFrom(c.Conn, int(length))
-		return
-	}
+	return destination, nil
 }
 
-func (c *XUDPConn) InitializeReadWaiter(options N.ReadWaitOptions) (needCopy bool) {
+func (c *XUDPConn) InitializeReadWaiter(options N.ReadWaitOptions) bool {
+	c.readAccess.Lock()
+	defer c.readAccess.Unlock()
 	c.readWaitOptions = options
 	return false
 }
 
-func (c *XUDPConn) WaitReadPacket() (buffer *buf.Buffer, destination M.Socksaddr, err error) {
-	var header [6]byte
-	_, err = io.ReadFull(c.Conn, header[:])
+func (c *XUDPConn) WaitReadPacket() (*buf.Buffer, M.Socksaddr, error) {
+	c.readAccess.Lock()
+	defer c.readAccess.Unlock()
+	length, destination, err := c.readPacketHeader()
 	if err != nil {
-		return
+		return nil, M.Socksaddr{}, err
 	}
-	length := binary.BigEndian.Uint16(header[:])
-	if err != nil {
-		return
-	}
-	switch header[4] {
-	case StatusNew:
-		return nil, M.Socksaddr{}, E.New("unexpected frame new")
-	case StatusKeep:
-		buffer = c.readWaitOptions.NewPacketBuffer()
-		if length != 4 {
-			start := buffer.Start()
-			_, err = buffer.ReadFullFrom(c.Conn, int(length)-4)
-			if err != nil {
-				buffer.Release()
-				return
-			}
-			buffer.Advance(1)
-			destination, err = AddressSerializer.ReadAddrPort(buffer)
-			if err != nil {
-				buffer.Release()
-				return
-			}
-			destination = destination.Unwrap()
-			buffer.Resize(start, 0)
-		} else {
-			destination = c.destination
-		}
-	case StatusEnd:
-		return nil, M.Socksaddr{}, io.EOF
-	case StatusKeepAlive:
-		buffer = c.readWaitOptions.NewPacketBuffer()
-	default:
-		return nil, M.Socksaddr{}, E.New("unexpected frame: ", header[4])
-	}
-	// option error
-	if header[5]&2 == 2 {
+	buffer := c.readWaitOptions.NewBufferSize(length)
+	if _, err = buffer.ReadFullFrom(c.Conn, length); err != nil {
+		c.readErr = err
 		buffer.Release()
-		return nil, M.Socksaddr{}, E.Cause(net.ErrClosed, "remote closed")
+		return nil, M.Socksaddr{}, err
 	}
-	// option data
-	if header[5]&1 != 1 {
-		destination, err = c.ReadPacket(buffer)
-		if err != nil {
-			buffer.Release()
-		}
-		c.readWaitOptions.PostReturn(buffer)
-		return
-	} else {
-		err = binary.Read(c.Conn, binary.BigEndian, &length)
-		if err != nil {
-			buffer.Release()
-			return
-		}
-		_, err = buffer.ReadFullFrom(c.Conn, int(length))
-		if err != nil {
-			buffer.Release()
-		}
-		c.readWaitOptions.PostReturn(buffer)
-		return
+	c.readWaitOptions.PostReturn(buffer)
+	return buffer, destination, nil
+}
+
+// Caller holds readAccess. Header-only keepalives are consumed iteratively;
+// every public read shares this parser and packet boundary handling.
+func (c *XUDPConn) readPacketHeader() (size int, target M.Socksaddr, err error) {
+	if c.readErr != nil {
+		return 0, M.Socksaddr{}, c.readErr
 	}
+	retryable := false
+	defer func() {
+		if err != nil && !retryable {
+			c.readErr = err
+		}
+	}()
+	for {
+		if n, readErr := io.ReadFull(c.Conn, c.readScratch[:6]); readErr != nil {
+			var timeout net.Error
+			retryable = n == 0 && errors.As(readErr, &timeout) && timeout.Timeout()
+			return 0, M.Socksaddr{}, readErr
+		}
+		length := binary.BigEndian.Uint16(c.readScratch[:2])
+		status, option := c.readScratch[4], c.readScratch[5]
+		if length < 4 {
+			return 0, M.Socksaddr{}, E.New("bad XUDP header length: ", length)
+		}
+		destination := c.destination
+		c.metadataReader = io.LimitedReader{R: c.Conn, N: int64(length - 4)}
+		switch status {
+		case StatusNew:
+			return 0, M.Socksaddr{}, E.New("unexpected frame new")
+		case StatusKeep:
+			if length > 4 {
+				if _, err := io.ReadFull(&c.metadataReader, c.readScratch[:1]); err != nil {
+					return 0, M.Socksaddr{}, err
+				}
+				if c.readScratch[0] != NetworkUDP {
+					return 0, M.Socksaddr{}, E.New("unexpected XUDP network")
+				}
+				var err error
+				destination, err = AddressSerializer.ReadAddrPortWithScratch(&c.metadataReader, c.readScratch[:])
+				if err != nil {
+					return 0, M.Socksaddr{}, err
+				}
+				if !destination.IsValid() || len(destination.Fqdn) > 255 {
+					return 0, M.Socksaddr{}, E.New("invalid XUDP destination")
+				}
+				destination = destination.Unwrap()
+			}
+		case StatusEnd:
+			if option&OptionError != 0 {
+				return 0, M.Socksaddr{}, net.ErrClosed
+			}
+			return 0, M.Socksaddr{}, io.EOF
+		case StatusKeepAlive:
+		default:
+			return 0, M.Socksaddr{}, E.New("unexpected XUDP frame: ", status)
+		}
+		if c.metadataReader.N > 0 {
+			if _, err := io.Copy(io.Discard, &c.metadataReader); err != nil {
+				return 0, M.Socksaddr{}, err
+			}
+			if c.metadataReader.N != 0 {
+				return 0, M.Socksaddr{}, io.ErrUnexpectedEOF
+			}
+		}
+		if option&OptionError != 0 {
+			return 0, M.Socksaddr{}, net.ErrClosed
+		}
+		if option&OptionData == 0 {
+			continue
+		}
+		if _, err := io.ReadFull(c.Conn, c.readScratch[:2]); err != nil {
+			return 0, M.Socksaddr{}, err
+		}
+		return int(binary.BigEndian.Uint16(c.readScratch[:2])), destination, nil
+	}
+}
+
+func (c *XUDPConn) discardPayload(length int) error {
+	c.metadataReader = io.LimitedReader{R: c.Conn, N: int64(length)}
+	if _, err := io.Copy(io.Discard, &c.metadataReader); err != nil {
+		c.readErr = err
+		return err
+	}
+	if c.metadataReader.N != 0 {
+		c.readErr = io.ErrUnexpectedEOF
+		return c.readErr
+	}
+	return io.ErrShortBuffer
 }
 
 func (c *XUDPConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
@@ -196,7 +205,7 @@ func (c *XUDPConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 }
 
 func (c *XUDPConn) frontHeadroom(addrLen int) int {
-	if !c.requestWritten {
+	if !c.requestWritten.Load() {
 		var headerLen int
 		headerLen += 2 // frame len
 		headerLen += 5 // frame header
@@ -212,13 +221,20 @@ func (c *XUDPConn) frontHeadroom(addrLen int) int {
 }
 
 func (c *XUDPConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
+	c.writeAccess.Lock()
+	defer c.writeAccess.Unlock()
+	if c.writeErr != nil {
+		buffer.Release()
+		return c.writeErr
+	}
 	dataLen := buffer.Len()
-	if dataLen > 65535 || !destination.IsValid() {
+	if dataLen > 65535 || (!destination.IsValid() || len(destination.Fqdn) > 255) {
 		buffer.Release()
 		return E.New("invalid XUDP packet")
 	}
+	buffer = N.NewReadWaitOptions(nil, c).Copy(buffer)
 	addrLen := M.SocksaddrSerializer.AddrPortLen(destination)
-	if !c.requestWritten {
+	if !c.requestWritten.Load() {
 		headerLen := c.frontHeadroom(addrLen)
 		header := buf.With(buffer.ExtendHeader(headerLen))
 		binary.BigEndian.PutUint16(header.Extend(2), uint16(headerLen-4))
@@ -238,7 +254,7 @@ func (c *XUDPConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) erro
 			common.Must1(header.Write(c.globalID[:]))
 		}
 		binary.BigEndian.PutUint16(header.Extend(2), uint16(dataLen))
-		c.requestWritten = true
+		c.requestWritten.Store(true)
 	} else {
 		header := buffer.ExtendHeader(c.frontHeadroom(addrLen))
 		binary.BigEndian.PutUint16(header, uint16(5+addrLen))
@@ -254,15 +270,20 @@ func (c *XUDPConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) erro
 		}
 		binary.BigEndian.PutUint16(header[7+addrLen:], uint16(dataLen))
 	}
-	return c.writer.WriteBuffer(buffer)
+	err := c.writer.WriteBuffer(buffer)
+	if err != nil {
+		c.writeErr = err
+		_ = c.Conn.Close()
+	}
+	return err
 }
 
 func (c *XUDPConn) FrontHeadroom() int {
-	return c.frontHeadroom(M.MaxSocksaddrLength)
+	return 9 + M.MaxSocksaddrLength + 8
 }
 
 func (c *XUDPConn) NeedHandshake() bool {
-	return !c.requestWritten
+	return !c.requestWritten.Load()
 }
 
 func (c *XUDPConn) NeedAdditionalReadDeadline() bool {

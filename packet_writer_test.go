@@ -81,15 +81,14 @@ func TestXUDPEmptyPacketIsDelivered(t *testing.T) {
 		t.Fatal(err)
 	}
 	binary.Write(&frame, binary.BigEndian, uint16(0))
-	reader, writer := io.Pipe()
-	defer reader.Close()
-	defer writer.Close()
-	session := &serverSession{conn: &frameReaderConn{Reader: bytes.NewReader(frame.Bytes())}, streams: map[uint16]*serverStream{1: {network: NetworkUDP, destination: destination, pipe: writer}}}
+	queue := newMuxPacketQueue(new(muxPacketBudget))
+	defer queue.close(nil, true)
+	session := &serverSession{conn: &frameReaderConn{Reader: bytes.NewReader(frame.Bytes())}, streams: map[uint16]*serverStream{1: {network: NetworkUDP, destination: destination, packets: queue}}}
 	done := make(chan error, 1)
 	go func() { done <- session.recv() }()
 	got := make(chan error, 1)
 	go func() {
-		conn := &serverMuxPacketConn{pipe: reader}
+		conn := &serverMuxPacketConn{packets: queue}
 		b := buf.NewSize(1)
 		defer b.Release()
 		addr, err := conn.ReadPacket(b)

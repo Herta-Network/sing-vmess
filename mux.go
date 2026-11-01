@@ -4,11 +4,11 @@ import (
 	std_bufio "bufio"
 	"context"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"os"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/metacubex/sing/common"
@@ -30,37 +30,58 @@ func HandleMuxConnection(ctx context.Context, conn net.Conn, metadata M.Metadata
 		streams:      make(map[uint16]*serverStream),
 		writer:       std_bufio.NewWriter(conn),
 	}
+	cleaned := make(chan struct{})
 	go func() {
+		defer close(cleaned)
 		<-ctx.Done()
-		session.cleanup(ctx.Err())
+		_ = conn.Close()
+		session.cleanup(context.Cause(ctx))
 	}()
-	return session.recvLoop(cancel)
+	err := session.recvLoop()
+	// The former byte pipe could not read the next frame until its preceding
+	// packet was handed off. Preserve that EOF boundary with queued packets:
+	// notify readers, drain accepted packets, then cancel handler contexts.
+	// Parent cancellation independently aborts queues and wakes this wait.
+	cause := err
+	if ctx.Err() != nil {
+		cause = context.Cause(ctx)
+	}
+	session.cleanup(cause)
+	session.packetBudget.waitDrained()
+	cancel(err)
+	<-cleaned
+	return err
 }
 
 type serverSession struct {
-	ctx          context.Context
-	metadata     M.Metadata
-	conn         net.Conn
-	directWriter N.ExtendedWriter
-	handler      Handler
-	streamAccess sync.RWMutex
-	streams      map[uint16]*serverStream
-	writer       *std_bufio.Writer
-	writeAccess  sync.Mutex
-	writeRace    uint32
+	ctx            context.Context
+	metadata       M.Metadata
+	conn           net.Conn
+	directWriter   N.ExtendedWriter
+	handler        Handler
+	streamAccess   sync.RWMutex
+	streams        map[uint16]*serverStream
+	writer         *std_bufio.Writer
+	writeAccess    sync.Mutex
+	writeErr       error
+	writeScratch   [9 + M.MaxSocksaddrLength]byte
+	readScratch    [256]byte
+	metadataReader io.LimitedReader
+	packetBudget   muxPacketBudget
+	closed         bool // protected by streamAccess
 }
 
 type serverStream struct {
 	network     byte
 	destination M.Socksaddr
 	pipe        *io.PipeWriter
+	packets     *muxPacketQueue
 }
 
-func (c *serverSession) recvLoop(cancel context.CancelCauseFunc) error {
+func (c *serverSession) recvLoop() error {
 	for {
 		err := c.recv()
 		if err != nil {
-			cancel(err)
 			return E.Cause(err, "mux connection closed")
 		}
 	}
@@ -68,53 +89,50 @@ func (c *serverSession) recvLoop(cancel context.CancelCauseFunc) error {
 
 func (c *serverSession) cleanup(err error) {
 	c.streamAccess.Lock()
-	for _, stream := range c.streams {
-		_ = stream.pipe.CloseWithError(err)
+	defer c.streamAccess.Unlock()
+	c.closed = true
+	discard := errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+	for id, stream := range c.streams {
+		if stream.pipe != nil {
+			_ = stream.pipe.CloseWithError(err)
+		}
+		delete(c.streams, id)
 	}
-	c.streamAccess.Unlock()
+	c.packetBudget.close(err, discard)
 }
 
 func (c *serverSession) recv() error {
-	var length uint16
-	err := binary.Read(c.conn, binary.BigEndian, &length)
-	if err != nil {
+	if _, err := io.ReadFull(c.conn, c.readScratch[:6]); err != nil {
 		return E.Cause(err, "read frame header")
 	}
-
-	var sessionID uint16
-	err = binary.Read(c.conn, binary.BigEndian, &sessionID)
-	if err != nil {
-		return err
+	length := binary.BigEndian.Uint16(c.readScratch[:2])
+	if length < 4 {
+		return E.New("bad mux header length: ", length)
 	}
-
-	var status byte
-	err = binary.Read(c.conn, binary.BigEndian, &status)
-	if err != nil {
-		return err
-	}
-
-	var option byte
-	err = binary.Read(c.conn, binary.BigEndian, &option)
-	if err != nil {
-		return err
-	}
-
+	sessionID := binary.BigEndian.Uint16(c.readScratch[2:4])
+	status, option := c.readScratch[4], c.readScratch[5]
 	var network byte
 	var destination M.Socksaddr
+	var err error
 	if length > 4 {
-		limitReader := io.LimitReader(c.conn, int64(length-4))
-		err = binary.Read(limitReader, binary.BigEndian, &network)
+		c.metadataReader = io.LimitedReader{R: c.conn, N: int64(length - 4)}
+		if _, err = io.ReadFull(&c.metadataReader, c.readScratch[:1]); err != nil {
+			return err
+		}
+		network = c.readScratch[0]
+		destination, err = AddressSerializer.ReadAddrPortWithScratch(&c.metadataReader, c.readScratch[:])
 		if err != nil {
 			return err
 		}
-		destination, err = AddressSerializer.ReadAddrPort(limitReader)
-		if err != nil {
-			return err
+		if !destination.IsValid() || len(destination.Fqdn) > 255 {
+			return E.New("invalid mux destination")
 		}
-		if limitReader.(*io.LimitedReader).N > 0 {
-			_, err = io.Copy(io.Discard, limitReader)
-			if err != nil {
+		if c.metadataReader.N > 0 {
+			if _, err = io.Copy(io.Discard, &c.metadataReader); err != nil {
 				return err
+			}
+			if c.metadataReader.N != 0 {
+				return io.ErrUnexpectedEOF
 			}
 		}
 	}
@@ -122,46 +140,41 @@ func (c *serverSession) recv() error {
 	var stream *serverStream
 	switch status {
 	case StatusNew:
-		pipeIn, pipeOut := io.Pipe()
-		stream = &serverStream{
-			network,
-			destination,
-			pipeOut,
-		}
-		c.streamAccess.Lock()
-		c.streams[sessionID] = stream
-		c.streamAccess.Unlock()
-		switch network {
-		case NetworkTCP, NetworkUDP:
-		default:
+		if network != NetworkTCP && network != NetworkUDP {
 			return E.New("bad network: ", network)
 		}
-		go func() {
+		stream = &serverStream{network: network, destination: destination}
+		var pipeIn *io.PipeReader
+		if network == NetworkTCP {
+			pipeIn, stream.pipe = io.Pipe()
+		} else {
+			stream.packets = newMuxPacketQueue(&c.packetBudget)
+		}
+		c.streamAccess.Lock()
+		_, duplicate := c.streams[sessionID]
+		if c.closed || duplicate {
+			c.streamAccess.Unlock()
+			stream.close(io.ErrClosedPipe, true)
+			if pipeIn != nil {
+				_ = pipeIn.Close()
+			}
+			return E.New("closed or duplicate mux stream: ", sessionID)
+		}
+		c.streams[sessionID] = stream
+		c.streamAccess.Unlock()
+		go func(stream *serverStream, destination M.Socksaddr) {
+			metadata := M.Metadata{Source: c.metadata.Source, Destination: destination}
 			var hErr error
 			if network == NetworkTCP {
-				hErr = c.handler.NewConnection(c.ctx, &serverMuxConn{
-					sessionID,
-					pipeIn,
-					c,
-				}, M.Metadata{
-					Source:      c.metadata.Source,
-					Destination: destination,
-				})
+				hErr = c.handler.NewConnection(c.ctx, &serverMuxConn{sessionID: sessionID, pipe: pipeIn, session: c, stream: stream}, metadata)
 			} else {
-				hErr = c.handler.NewPacketConnection(c.ctx, &serverMuxPacketConn{
-					sessionID:   sessionID,
-					pipe:        pipeIn,
-					session:     c,
-					destination: destination,
-				}, M.Metadata{
-					Source:      c.metadata.Source,
-					Destination: destination,
-				})
+				hErr = c.handler.NewPacketConnection(c.ctx, &serverMuxPacketConn{sessionID: sessionID, packets: stream.packets, session: c, stream: stream, destination: destination}, metadata)
 			}
 			if hErr != nil {
 				c.handler.NewError(c.ctx, hErr)
+				_ = c.closeStream(sessionID, stream, hErr)
 			}
-		}()
+		}(stream, destination)
 	case StatusKeep:
 		var loaded bool
 		c.streamAccess.Lock()
@@ -174,7 +187,7 @@ func (c *serverSession) recv() error {
 		if option&OptionError == OptionError {
 			err = E.New("remote closed wth error")
 		}
-		c.localClose(sessionID, err)
+		c.localClose(sessionID, nil, err, false)
 	case StatusKeepAlive:
 	default:
 		return E.New("bad session status: ", status)
@@ -184,11 +197,12 @@ func (c *serverSession) recv() error {
 		return nil
 	}
 
-	err = binary.Read(c.conn, binary.BigEndian, &length)
+	_, err = io.ReadFull(c.conn, c.readScratch[:2])
 	if err != nil {
 		return err
 	}
 
+	length = binary.BigEndian.Uint16(c.readScratch[:2])
 	if length == 0 && (stream == nil || stream.network != NetworkUDP) {
 		return nil
 	}
@@ -197,194 +211,211 @@ func (c *serverSession) recv() error {
 		return common.Error(io.CopyN(io.Discard, c.conn, int64(length)))
 	}
 
-	data := buf.NewSize(int(length))
-	defer data.Release()
-
-	_, err = data.ReadFullFrom(c.conn, int(length))
-	if err != nil {
-		return err
-	}
-
-	if !destination.IsValid() {
+	if !destination.IsValid() || len(destination.Fqdn) > 255 {
 		destination = stream.destination
 	}
-
-	err = c.recvTo(stream, data, destination)
-	if err != nil {
-		return c.close(sessionID, err)
+	if stream.network == NetworkUDP {
+		options := stream.packets.readOptions()
+		data := options.NewBufferSize(int(length))
+		if _, err = data.ReadFullFrom(c.conn, int(length)); err != nil {
+			data.Release()
+			return err
+		}
+		options.PostReturn(data)
+		if err = stream.packets.push(muxPacket{data, destination}); err != nil {
+			return c.closeStream(sessionID, stream, err)
+		}
+		return nil
 	}
-
+	data := buf.NewSize(int(length))
+	defer data.Release()
+	if _, err = data.ReadFullFrom(c.conn, int(length)); err != nil {
+		return err
+	}
+	if _, err = stream.pipe.Write(data.Bytes()); err != nil {
+		return c.closeStream(sessionID, stream, err)
+	}
 	return nil
 }
 
-func (c *serverSession) recvTo(stream *serverStream, data *buf.Buffer, destination M.Socksaddr) error {
-	if stream.network == NetworkTCP {
-		return common.Error(stream.pipe.Write(data.Bytes()))
-	} else {
-		err := binary.Write(stream.pipe, binary.BigEndian, uint16(data.Len()))
-		if err != nil {
-			return err
-		}
-		if !data.IsEmpty() {
-			_, err = stream.pipe.Write(data.Bytes())
-			if err != nil {
-				return err
-			}
-		}
-		err = AddressSerializer.WriteAddrPort(stream.pipe, destination)
-		if err != nil {
-			return err
-		}
-		return nil
+func (s *serverStream) close(err error, discard bool) {
+	if s.pipe != nil {
+		_ = s.pipe.CloseWithError(err)
+	}
+	if s.packets != nil {
+		s.packets.close(err, discard)
 	}
 }
 
 func (c *serverSession) syncWrite(sessionID uint16, data []byte) (int, error) {
-	writeRace := atomic.AddUint32(&c.writeRace, 1)
 	c.writeAccess.Lock()
 	defer c.writeAccess.Unlock()
+	if err := c.writeStateError(); err != nil {
+		return 0, c.failWrite(err)
+	}
 	err := c.writeFrame(sessionID, data)
 	if err != nil {
-		return 0, err
+		return 0, c.failWrite(err)
 	}
-	if writeRace == atomic.LoadUint32(&c.writeRace) {
-		err = c.writer.Flush()
-		if err != nil {
-			return 0, err
-		}
+	if err = c.writer.Flush(); err != nil {
+		return 0, c.failWrite(err)
 	}
 	return len(data), nil
 }
 
 func (c *serverSession) writeFrame(sessionID uint16, data []byte) error {
-	err := binary.Write(c.writer, binary.BigEndian, uint16(4))
-	if err != nil {
-		return err
+	for {
+		size := len(data)
+		if size > 65535 {
+			size = 65535
+		}
+		header := c.writeScratch[:8]
+		binary.BigEndian.PutUint16(header, 4)
+		binary.BigEndian.PutUint16(header[2:], sessionID)
+		header[4], header[5] = StatusKeep, OptionData
+		binary.BigEndian.PutUint16(header[6:], uint16(size))
+		if _, err := c.writer.Write(header); err != nil {
+			return err
+		}
+		if _, err := c.writer.Write(data[:size]); err != nil {
+			return err
+		}
+		data = data[size:]
+		if len(data) == 0 {
+			return nil
+		}
 	}
-	err = binary.Write(c.writer, binary.BigEndian, sessionID)
-	if err != nil {
-		return err
-	}
-	err = binary.Write(c.writer, binary.BigEndian, uint8(StatusKeep))
-	if err != nil {
-		return err
-	}
-	err = binary.Write(c.writer, binary.BigEndian, uint8(OptionData))
-	if err != nil {
-		return err
-	}
-	err = binary.Write(c.writer, binary.BigEndian, uint16(len(data)))
-	if err != nil {
-		return err
-	}
-	return common.Error(c.writer.Write(data))
 }
 
 func (c *serverSession) syncWritePacket(sessionID uint16, data []byte, destination M.Socksaddr) (int, error) {
-	writeRace := atomic.AddUint32(&c.writeRace, 1)
+	if len(data) > 65535 || (!destination.IsValid() || len(destination.Fqdn) > 255) {
+		return 0, os.ErrInvalid
+	}
 	c.writeAccess.Lock()
 	defer c.writeAccess.Unlock()
+	if err := c.writeStateError(); err != nil {
+		return 0, c.failWrite(err)
+	}
 	err := c.writePacketFrame(sessionID, data, destination)
 	if err != nil {
-		return 0, err
+		return 0, c.failWrite(err)
 	}
-	if writeRace == atomic.LoadUint32(&c.writeRace) {
-		err = c.writer.Flush()
-		if err != nil {
-			return 0, err
-		}
+	if err = c.writer.Flush(); err != nil {
+		return 0, c.failWrite(err)
 	}
 	return len(data), nil
 }
 
 func (c *serverSession) writePacketFrame(sessionID uint16, data []byte, destination M.Socksaddr) error {
-	err := binary.Write(c.writer, binary.BigEndian, uint16(5+AddressSerializer.AddrPortLen(destination)))
-	if err != nil {
+	headerLen := 9 + AddressSerializer.AddrPortLen(destination)
+	header := c.writeScratch[:headerLen]
+	if err := encodeMuxPacketHeader(header, sessionID, len(data), destination); err != nil {
 		return err
 	}
-	err = binary.Write(c.writer, binary.BigEndian, sessionID)
-	if err != nil {
-		return err
-	}
-	err = binary.Write(c.writer, binary.BigEndian, uint8(StatusKeep))
-	if err != nil {
-		return err
-	}
-	err = binary.Write(c.writer, binary.BigEndian, uint8(OptionData))
-	if err != nil {
-		return err
-	}
-	if destination.IsValid() {
-		err = binary.Write(c.writer, binary.BigEndian, uint8(NetworkUDP))
-		if err != nil {
-			return err
-		}
-		err = AddressSerializer.WriteAddrPort(c.writer, destination)
-		if err != nil {
-			return err
-		}
-	}
-	err = binary.Write(c.writer, binary.BigEndian, uint16(len(data)))
-	if err != nil {
+	if _, err := c.writer.Write(header); err != nil {
 		return err
 	}
 	return common.Error(c.writer.Write(data))
 }
 
-func (c *serverSession) close(sessionID uint16, err error) error {
-	if c.localClose(sessionID, err) {
+func (c *serverSession) closeStream(sessionID uint16, stream *serverStream, err error) error {
+	// Closing a retired stream must still release its queue, but must not close
+	// a later stream that reuses the same wire ID.
+	stream.close(err, true)
+	if c.localClose(sessionID, stream, err, true) {
 		return c.syncClose(sessionID, err != nil)
 	}
 	return nil
 }
 
-func (c *serverSession) localClose(sessionID uint16, err error) bool {
-	var closed bool
+func (c *serverSession) localClose(sessionID uint16, expected *serverStream, err error, discard bool) bool {
 	c.streamAccess.Lock()
-	if session, loaded := c.streams[sessionID]; loaded {
+	stream, loaded := c.streams[sessionID]
+	if loaded && (expected == nil || expected == stream) {
 		delete(c.streams, sessionID)
-		_ = session.pipe.CloseWithError(err)
-		closed = true
+	} else {
+		loaded = false
 	}
 	c.streamAccess.Unlock()
-	return closed
+	if loaded {
+		stream.close(err, discard)
+	}
+	return loaded
 }
 
 func (c *serverSession) syncClose(sessionID uint16, hasError bool) error {
-	writeRace := atomic.AddUint32(&c.writeRace, 1)
 	c.writeAccess.Lock()
 	defer c.writeAccess.Unlock()
+	if err := c.writeStateError(); err != nil {
+		return c.failWrite(err)
+	}
 	err := c.writeCloseFrame(sessionID, hasError)
 	if err != nil {
-		return err
+		return c.failWrite(err)
 	}
-	if writeRace == atomic.LoadUint32(&c.writeRace) {
-		err = c.writer.Flush()
-		if err != nil {
-			return err
-		}
+	if err = c.writer.Flush(); err != nil {
+		return c.failWrite(err)
 	}
 	return nil
 }
 
 func (c *serverSession) writeCloseFrame(sessionID uint16, hasError bool) error {
-	err := binary.Write(c.writer, binary.BigEndian, uint16(4))
-	if err != nil {
-		return err
-	}
-	err = binary.Write(c.writer, binary.BigEndian, sessionID)
-	if err != nil {
-		return err
-	}
-	err = binary.Write(c.writer, binary.BigEndian, uint8(StatusEnd))
-	if err != nil {
-		return err
-	}
-	var option uint8
+	header := c.writeScratch[:6]
+	binary.BigEndian.PutUint16(header, 4)
+	binary.BigEndian.PutUint16(header[2:], sessionID)
+	header[4], header[5] = StatusEnd, 0
 	if hasError {
-		option = OptionError
+		header[5] = OptionError
 	}
-	err = binary.Write(c.writer, binary.BigEndian, option)
+	return common.Error(c.writer.Write(header))
+}
+
+func encodeMuxPacketHeader(header []byte, sessionID uint16, size int, destination M.Socksaddr) error {
+	binary.BigEndian.PutUint16(header, uint16(len(header)-4))
+	binary.BigEndian.PutUint16(header[2:], sessionID)
+	header[4], header[5], header[6] = StatusKeep, OptionData, NetworkUDP
+	if err := AddressSerializer.WriteAddrPortBuffer(buf.With(header[7:len(header)-2]), destination); err != nil {
+		return err
+	}
+	binary.BigEndian.PutUint16(header[len(header)-2:], uint16(size))
+	return nil
+}
+
+// All stream, packet and control writes share the cipher/transport writer.
+// Flush older borrowed writes before handing off an owned frame.
+func (c *serverSession) writeOwned(buffer *buf.Buffer) error {
+	c.writeAccess.Lock()
+	defer c.writeAccess.Unlock()
+	if err := c.writeStateError(); err != nil {
+		buffer.Release()
+		return err
+	}
+	if c.writer != nil && c.writer.Buffered() != 0 {
+		if err := c.writer.Flush(); err != nil {
+			buffer.Release()
+			return c.failWrite(err)
+		}
+	}
+	return c.failWrite(c.directWriter.WriteBuffer(buffer))
+}
+
+func (c *serverSession) writeStateError() error {
+	if c.writeErr != nil {
+		return c.writeErr
+	}
+	if c.ctx != nil {
+		return c.ctx.Err()
+	}
+	return nil
+}
+
+func (c *serverSession) failWrite(err error) error {
+	if err != nil {
+		c.writeErr = err
+		if c.conn != nil {
+			_ = c.conn.Close()
+		}
+	}
 	return err
 }
 
@@ -392,6 +423,7 @@ type serverMuxConn struct {
 	sessionID uint16
 	pipe      *io.PipeReader
 	session   *serverSession
+	stream    *serverStream
 }
 
 func (c *serverMuxConn) Read(b []byte) (n int, err error) {
@@ -404,15 +436,18 @@ func (c *serverMuxConn) Write(b []byte) (n int, err error) {
 
 func (c *serverMuxConn) WriteBuffer(buffer *buf.Buffer) error {
 	dataLen := buffer.Len()
-	header := buf.With(buffer.ExtendHeader(8))
-	common.Must(
-		binary.Write(header, binary.BigEndian, uint16(4)),
-		binary.Write(header, binary.BigEndian, c.sessionID),
-		binary.Write(header, binary.BigEndian, uint8(StatusKeep)),
-		binary.Write(header, binary.BigEndian, uint8(OptionData)),
-		binary.Write(header, binary.BigEndian, uint16(dataLen)),
-	)
-	return c.session.directWriter.WriteBuffer(buffer)
+	if dataLen > 65535 {
+		defer buffer.Release()
+		_, err := c.session.syncWrite(c.sessionID, buffer.Bytes())
+		return err
+	}
+	buffer = N.NewReadWaitOptions(nil, c).Copy(buffer)
+	header := buffer.ExtendHeader(8)
+	binary.BigEndian.PutUint16(header, 4)
+	binary.BigEndian.PutUint16(header[2:], c.sessionID)
+	header[4], header[5] = StatusKeep, OptionData
+	binary.BigEndian.PutUint16(header[6:], uint16(dataLen))
+	return c.session.writeOwned(buffer)
 }
 
 func (c *serverMuxConn) FrontHeadroom() int {
@@ -424,7 +459,8 @@ func (c *serverMuxConn) UpstreamWriter() any {
 }
 
 func (c *serverMuxConn) Close() error {
-	return c.session.close(c.sessionID, nil)
+	_ = c.pipe.Close()
+	return c.session.closeStream(c.sessionID, c.stream, nil)
 }
 
 func (c *serverMuxConn) LocalAddr() net.Addr {
@@ -457,11 +493,12 @@ var (
 )
 
 type serverMuxPacketConn struct {
-	sessionID       uint16
-	pipe            *io.PipeReader
-	session         *serverSession
-	destination     M.Socksaddr
-	readWaitOptions N.ReadWaitOptions
+	sessionID   uint16
+	packets     *muxPacketQueue
+	stream      *serverStream
+	readAccess  sync.Mutex
+	session     *serverSession
+	destination M.Socksaddr
 }
 
 func (c *serverMuxPacketConn) Read(b []byte) (n int, err error) {
@@ -477,65 +514,50 @@ func (c *serverMuxPacketConn) RemoteAddr() net.Addr {
 	return c.destination.UDPAddr()
 }
 
-func (c *serverMuxPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
-	var length uint16
-	err = binary.Read(c.pipe, binary.BigEndian, &length)
+func (c *serverMuxPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	c.readAccess.Lock()
+	defer c.readAccess.Unlock()
+	packet, err := c.packets.pop()
 	if err != nil {
-		return
+		return 0, nil, err
 	}
-	if int(length) > len(p) {
-		return 0, nil, E.Extend(io.ErrShortBuffer, "mux need ", length)
+	defer packet.buffer.Release()
+	if len(p) < packet.buffer.Len() {
+		return 0, nil, io.ErrShortBuffer
 	}
-	n, err = io.ReadFull(c.pipe, p[:length])
-	if err == nil {
-		addr, err = AddressSerializer.ReadAddrPort(c.pipe)
-	}
-	return
+	return copy(p, packet.buffer.Bytes()), packet.destination, nil
 }
 
-func (c *serverMuxPacketConn) ReadPacket(buffer *buf.Buffer) (destination M.Socksaddr, err error) {
-	var length uint16
-	err = binary.Read(c.pipe, binary.BigEndian, &length)
+func (c *serverMuxPacketConn) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
+	c.readAccess.Lock()
+	defer c.readAccess.Unlock()
+	packet, err := c.packets.pop()
 	if err != nil {
-		return
+		return M.Socksaddr{}, err
 	}
-	if int(length) > buffer.FreeLen() {
-		return M.Socksaddr{}, E.Extend(io.ErrShortBuffer, "mux need ", length)
+	defer packet.buffer.Release()
+	if buffer.FreeLen() < packet.buffer.Len() {
+		return M.Socksaddr{}, io.ErrShortBuffer
 	}
-	_, err = buffer.ReadFullFrom(c.pipe, int(length))
-	if err == nil {
-		destination, err = AddressSerializer.ReadAddrPort(c.pipe)
-		if err == nil {
-			destination = destination.Unwrap()
-		}
-	}
-	return
+	_, err = buffer.Write(packet.buffer.Bytes())
+	return packet.destination, err
 }
 
-func (c *serverMuxPacketConn) InitializeReadWaiter(options N.ReadWaitOptions) (needCopy bool) {
-	c.readWaitOptions = options
+func (c *serverMuxPacketConn) InitializeReadWaiter(options N.ReadWaitOptions) bool {
+	c.readAccess.Lock()
+	defer c.readAccess.Unlock()
+	c.packets.setOptions(options)
 	return false
 }
 
-func (c *serverMuxPacketConn) WaitReadPacket() (buffer *buf.Buffer, destination M.Socksaddr, err error) {
-	var length uint16
-	err = binary.Read(c.pipe, binary.BigEndian, &length)
+func (c *serverMuxPacketConn) WaitReadPacket() (*buf.Buffer, M.Socksaddr, error) {
+	c.readAccess.Lock()
+	defer c.readAccess.Unlock()
+	packet, err := c.packets.pop()
 	if err != nil {
-		return
+		return nil, M.Socksaddr{}, err
 	}
-	buffer = c.readWaitOptions.NewPacketBuffer()
-	_, err = buffer.ReadFullFrom(c.pipe, int(length))
-	if err == nil {
-		destination, err = AddressSerializer.ReadAddrPort(c.pipe)
-		if err == nil {
-			destination = destination.Unwrap()
-		}
-	}
-	if err != nil {
-		buffer.Release()
-	}
-	c.readWaitOptions.PostReturn(buffer)
-	return
+	return c.packets.readOptions().Copy(packet.buffer), packet.destination, nil
 }
 
 func (c *serverMuxPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
@@ -544,20 +566,17 @@ func (c *serverMuxPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error
 
 func (c *serverMuxPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
 	dataLen := buffer.Len()
-	header := buf.With(buffer.ExtendHeader(9 + AddressSerializer.AddrPortLen(destination)))
-	common.Must(
-		binary.Write(header, binary.BigEndian, uint16(5+AddressSerializer.AddrPortLen(destination))),
-		binary.Write(header, binary.BigEndian, c.sessionID),
-		binary.Write(header, binary.BigEndian, uint8(StatusKeep)),
-		binary.Write(header, binary.BigEndian, uint8(OptionData)),
-		binary.Write(header, binary.BigEndian, uint8(NetworkUDP)),
-	)
-	err := AddressSerializer.WriteAddrPort(header, destination)
-	if err != nil {
+	if dataLen > 65535 || (!destination.IsValid() || len(destination.Fqdn) > 255) {
+		buffer.Release()
+		return os.ErrInvalid
+	}
+	buffer = N.NewReadWaitOptions(nil, c).Copy(buffer)
+	header := buffer.ExtendHeader(9 + AddressSerializer.AddrPortLen(destination))
+	if err := encodeMuxPacketHeader(header, c.sessionID, dataLen, destination); err != nil {
+		buffer.Release()
 		return err
 	}
-	common.Must(binary.Write(header, binary.BigEndian, uint16(dataLen)))
-	return c.session.directWriter.WriteBuffer(buffer)
+	return c.session.writeOwned(buffer)
 }
 
 func (c *serverMuxPacketConn) FrontHeadroom() int {
@@ -569,7 +588,7 @@ func (c *serverMuxPacketConn) UpstreamWriter() any {
 }
 
 func (c *serverMuxPacketConn) Close() error {
-	return c.session.close(c.sessionID, nil)
+	return c.session.closeStream(c.sessionID, c.stream, nil)
 }
 
 func (c *serverMuxPacketConn) LocalAddr() net.Addr {
