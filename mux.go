@@ -189,7 +189,7 @@ func (c *serverSession) recv() error {
 		return err
 	}
 
-	if length == 0 {
+	if length == 0 && (stream == nil || stream.network != NetworkUDP) {
 		return nil
 	}
 
@@ -225,9 +225,11 @@ func (c *serverSession) recvTo(stream *serverStream, data *buf.Buffer, destinati
 		if err != nil {
 			return err
 		}
-		_, err = stream.pipe.Write(data.Bytes())
-		if err != nil {
-			return err
+		if !data.IsEmpty() {
+			_, err = stream.pipe.Write(data.Bytes())
+			if err != nil {
+				return err
+			}
 		}
 		err = AddressSerializer.WriteAddrPort(stream.pipe, destination)
 		if err != nil {

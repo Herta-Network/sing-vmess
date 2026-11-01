@@ -385,7 +385,10 @@ func (c *rawServerConn) writeResponse() error {
 		responseKey := md5.Sum(c.requestKey)
 		responseNonce := md5.Sum(c.requestNonce)
 		headerWriter := NewStreamWriter(c.Conn, responseKey[:], responseNonce[:])
-		_, err := headerWriter.Write([]byte{c.responseHeader, c.option, 0, 0})
+		n, err := headerWriter.Write([]byte{c.responseHeader, c.option, 0, 0})
+		if n != 4 && err == nil {
+			err = io.ErrShortWrite
+		}
 		if err != nil {
 			return E.Cause(err, "write response")
 		}
@@ -418,7 +421,10 @@ func (c *rawServerConn) writeResponse() error {
 		headerCipher.Seal(responseBuffer.Index(headerIndex), headerNonce, responseBuffer.From(headerIndex), nil)
 		responseBuffer.Extend(CipherOverhead)
 
-		_, err := c.Conn.Write(responseBuffer.Bytes())
+		n, err := c.Conn.Write(responseBuffer.Bytes())
+		if n != responseBuffer.Len() && err == nil {
+			err = io.ErrShortWrite
+		}
 		if err != nil {
 			return err
 		}
@@ -518,14 +524,8 @@ func (c *serverPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) 
 	return
 }
 
-func (c *serverPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
-	if c.writer == nil {
-		err = c.writeResponse()
-		if err != nil {
-			return
-		}
-	}
-	return c.writer.Write(p)
+func (c *serverPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	return bufio.WritePacketBuffer(c, buf.As(p), M.SocksaddrFromNet(addr))
 }
 
 func (c *serverPacketConn) ReadPacket(buffer *buf.Buffer) (destination M.Socksaddr, err error) {
@@ -538,11 +538,20 @@ func (c *serverPacketConn) ReadPacket(buffer *buf.Buffer) (destination M.Socksad
 }
 
 func (c *serverPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
+	if err := validatePacket(buffer, c.security); err != nil {
+		buffer.Release()
+		return err
+	}
 	if c.writer == nil {
-		err := c.writeResponse()
-		if err != nil {
+		if err := c.writeResponse(); err != nil {
+			buffer.Release()
 			return err
 		}
 	}
-	return c.writer.WriteBuffer(buffer)
+	return writePacketBuffer(c.writer, buffer)
+}
+
+func (c *serverPacketConn) Write(p []byte) (int, error) { return c.WriteTo(p, M.Socksaddr{}) }
+func (c *serverPacketConn) WriteBuffer(buffer *buf.Buffer) error {
+	return c.WritePacket(buffer, M.Socksaddr{})
 }

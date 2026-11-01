@@ -504,14 +504,8 @@ func (c *clientPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) 
 	return
 }
 
-func (c *clientPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
-	if c.writer == nil {
-		err = c.writeHandshake(nil)
-		if err != nil {
-			return
-		}
-	}
-	return c.writer.Write(p)
+func (c *clientPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	return bufio.WritePacketBuffer(c, buf.As(p), M.SocksaddrFromNet(addr))
 }
 
 func (c *clientPacketConn) ReadPacket(buffer *buf.Buffer) (destination M.Socksaddr, err error) {
@@ -530,12 +524,20 @@ func (c *clientPacketConn) ReadPacket(buffer *buf.Buffer) (destination M.Socksad
 }
 
 func (c *clientPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
+	if err := validatePacket(buffer, c.security); err != nil {
+		buffer.Release()
+		return err
+	}
 	if c.writer == nil {
-		err := c.writeHandshake(nil)
-		if err != nil {
+		if err := c.writeHandshake(nil); err != nil {
 			buffer.Release()
 			return err
 		}
 	}
-	return c.writer.WriteBuffer(buffer)
+	return writePacketBuffer(c.writer, buffer)
+}
+
+func (c *clientPacketConn) Write(p []byte) (int, error) { return c.WriteTo(p, c.destination) }
+func (c *clientPacketConn) WriteBuffer(buffer *buf.Buffer) error {
+	return c.WritePacket(buffer, c.destination)
 }

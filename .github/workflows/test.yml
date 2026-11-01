@@ -1,10 +1,12 @@
 name: test
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - main
       - dev
+      - for-meta
     paths-ignore:
       - '**.md'
       - '.github/**'
@@ -13,6 +15,7 @@ on:
     branches:
       - main
       - dev
+      - for-meta
 
 jobs:
   build:
@@ -30,6 +33,8 @@ jobs:
       - name: Build
         run: |
           make test
+      - name: Check packet concurrency
+        run: go test -race ./... -count=1 -timeout=90s
   build_go120:
     name: Linux (Go 1.20)
     runs-on: ubuntu-latest

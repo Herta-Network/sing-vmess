@@ -9,3 +9,5 @@ require (
 )
 
 require golang.org/x/sys v0.28.0 // indirect
+
+replace github.com/metacubex/sing => github.com/Herta-Network/sing v0.0.0-20261101103341-a402b0b490ba
