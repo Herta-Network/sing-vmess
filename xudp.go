@@ -213,26 +213,31 @@ func (c *XUDPConn) frontHeadroom(addrLen int) int {
 
 func (c *XUDPConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
 	dataLen := buffer.Len()
+	if dataLen > 65535 || !destination.IsValid() {
+		buffer.Release()
+		return E.New("invalid XUDP packet")
+	}
 	addrLen := M.SocksaddrSerializer.AddrPortLen(destination)
 	if !c.requestWritten {
 		headerLen := c.frontHeadroom(addrLen)
 		header := buf.With(buffer.ExtendHeader(headerLen))
+		binary.BigEndian.PutUint16(header.Extend(2), uint16(headerLen-4))
 		common.Must(
-			binary.Write(header, binary.BigEndian, uint16(headerLen-4)),
 			header.WriteByte(0),
 			header.WriteByte(0),
 			header.WriteByte(1), // frame type new
 			header.WriteByte(1), // option data
 			header.WriteByte(NetworkUDP),
 		)
-		err := AddressSerializer.WriteAddrPort(header, destination)
+		err := AddressSerializer.WriteAddrPortBuffer(header, destination)
 		if err != nil {
+			buffer.Release()
 			return err
 		}
 		if c.globalID != [8]byte{} {
 			common.Must1(header.Write(c.globalID[:]))
 		}
-		common.Must(binary.Write(header, binary.BigEndian, uint16(dataLen)))
+		binary.BigEndian.PutUint16(header.Extend(2), uint16(dataLen))
 		c.requestWritten = true
 	} else {
 		header := buffer.ExtendHeader(c.frontHeadroom(addrLen))
@@ -242,8 +247,9 @@ func (c *XUDPConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) erro
 		header[4] = 2 // frame keep
 		header[5] = 1 // option data
 		header[6] = NetworkUDP
-		err := AddressSerializer.WriteAddrPort(buf.With(header[7:]), destination)
+		err := AddressSerializer.WriteAddrPortBuffer(buf.With(header[7:]), destination)
 		if err != nil {
+			buffer.Release()
 			return err
 		}
 		binary.BigEndian.PutUint16(header[7+addrLen:], uint16(dataLen))

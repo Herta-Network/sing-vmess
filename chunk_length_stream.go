@@ -83,6 +83,7 @@ type StreamChunkWriter struct {
 	upstream      N.ExtendedWriter
 	chunkMasking  sha3.ShakeHash
 	globalPadding sha3.ShakeHash
+	hashBuffer    [2]byte
 	hashAccess    sync.Mutex
 	writeAccess   sync.Mutex
 }
@@ -101,14 +102,14 @@ func (w *StreamChunkWriter) Write(p []byte) (n int, err error) {
 	if w.globalPadding != nil || w.chunkMasking != nil {
 		w.hashAccess.Lock()
 		if w.globalPadding != nil {
-			var hashCode uint16
-			common.Must(binary.Read(w.globalPadding, binary.BigEndian, &hashCode))
+			common.Must1(io.ReadFull(w.globalPadding, w.hashBuffer[:]))
+			hashCode := binary.BigEndian.Uint16(w.hashBuffer[:])
 			paddingLen = hashCode % MaxPaddingSize
 			dataLen += paddingLen
 		}
 		if w.chunkMasking != nil {
-			var hashCode uint16
-			common.Must(binary.Read(w.chunkMasking, binary.BigEndian, &hashCode))
+			common.Must1(io.ReadFull(w.chunkMasking, w.hashBuffer[:]))
+			hashCode := binary.BigEndian.Uint16(w.hashBuffer[:])
 			dataLen ^= hashCode
 		}
 		w.hashAccess.Unlock()
@@ -138,14 +139,14 @@ func (w *StreamChunkWriter) WriteBuffer(buffer *buf.Buffer) error {
 	if w.globalPadding != nil || w.chunkMasking != nil {
 		w.hashAccess.Lock()
 		if w.globalPadding != nil {
-			var hashCode uint16
-			common.Must(binary.Read(w.globalPadding, binary.BigEndian, &hashCode))
+			common.Must1(io.ReadFull(w.globalPadding, w.hashBuffer[:]))
+			hashCode := binary.BigEndian.Uint16(w.hashBuffer[:])
 			paddingLen = hashCode % MaxPaddingSize
 			dataLen += paddingLen
 		}
 		if w.chunkMasking != nil {
-			var hashCode uint16
-			common.Must(binary.Read(w.chunkMasking, binary.BigEndian, &hashCode))
+			common.Must1(io.ReadFull(w.chunkMasking, w.hashBuffer[:]))
+			hashCode := binary.BigEndian.Uint16(w.hashBuffer[:])
 			dataLen ^= hashCode
 		}
 		w.hashAccess.Unlock()
@@ -167,14 +168,14 @@ func (w *StreamChunkWriter) WriteWithChecksum(checksum uint32, p []byte) (n int,
 	if w.globalPadding != nil || w.chunkMasking != nil {
 		w.hashAccess.Lock()
 		if w.globalPadding != nil {
-			var hashCode uint16
-			common.Must(binary.Read(w.globalPadding, binary.BigEndian, &hashCode))
+			common.Must1(io.ReadFull(w.globalPadding, w.hashBuffer[:]))
+			hashCode := binary.BigEndian.Uint16(w.hashBuffer[:])
 			paddingLen = hashCode % MaxPaddingSize
 			dataLen += paddingLen
 		}
 		if w.chunkMasking != nil {
-			var hashCode uint16
-			common.Must(binary.Read(w.chunkMasking, binary.BigEndian, &hashCode))
+			common.Must1(io.ReadFull(w.chunkMasking, w.hashBuffer[:]))
+			hashCode := binary.BigEndian.Uint16(w.hashBuffer[:])
 			dataLen ^= hashCode
 		}
 		w.hashAccess.Unlock()

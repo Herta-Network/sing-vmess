@@ -100,6 +100,7 @@ type AEADChunkWriter struct {
 	globalPadding sha3.ShakeHash
 	nonce         []byte
 	nonceCount    uint16
+	hashBuffer    [2]byte
 	hashAccess    sync.Mutex
 	writeAccess   sync.Mutex
 }
@@ -128,8 +129,8 @@ func (w *AEADChunkWriter) Write(p []byte) (n int, err error) {
 	var paddingLen uint16
 	if w.globalPadding != nil {
 		w.hashAccess.Lock()
-		var hashCode uint16
-		common.Must(binary.Read(w.globalPadding, binary.BigEndian, &hashCode))
+		common.Must1(io.ReadFull(w.globalPadding, w.hashBuffer[:]))
+		hashCode := binary.BigEndian.Uint16(w.hashBuffer[:])
 		paddingLen = hashCode % MaxPaddingSize
 		dataLength += paddingLen
 		w.hashAccess.Unlock()
@@ -171,8 +172,8 @@ func (w *AEADChunkWriter) WriteBuffer(buffer *buf.Buffer) error {
 	var paddingLen uint16
 	if w.globalPadding != nil {
 		w.hashAccess.Lock()
-		var hashCode uint16
-		common.Must(binary.Read(w.globalPadding, binary.BigEndian, &hashCode))
+		common.Must1(io.ReadFull(w.globalPadding, w.hashBuffer[:]))
+		hashCode := binary.BigEndian.Uint16(w.hashBuffer[:])
 		paddingLen = hashCode % MaxPaddingSize
 		dataLength += paddingLen
 		w.hashAccess.Unlock()

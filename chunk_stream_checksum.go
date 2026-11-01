@@ -69,7 +69,7 @@ func (w *StreamChecksumWriter) WriteBuffer(buffer *buf.Buffer) error {
 	hash := fnv.New32a()
 	common.Must1(hash.Write(buffer.Bytes()))
 	hash.Sum(buffer.ExtendHeader(4)[:0])
-	return common.Error(w.upstream.Write(buffer.Bytes()))
+	return w.upstream.WriteBuffer(buffer)
 }
 
 func (w *StreamChecksumWriter) FrontHeadroom() int {

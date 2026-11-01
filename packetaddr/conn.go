@@ -3,7 +3,6 @@ package packetaddr
 import (
 	"net"
 
-	"github.com/metacubex/sing/common"
 	"github.com/metacubex/sing/common/buf"
 	"github.com/metacubex/sing/common/bufio"
 	E "github.com/metacubex/sing/common/exceptions"
@@ -61,16 +60,8 @@ func (c *PacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 	return
 }
 
-func (c *PacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
-	destination := M.SocksaddrFromNet(addr)
-	buffer := buf.NewSize(AddressSerializer.AddrPortLen(destination) + len(p))
-	defer buffer.Release()
-	err = AddressSerializer.WriteAddrPort(buffer, destination)
-	if err != nil {
-		return
-	}
-	common.Must1(buffer.Write(p))
-	return c.NetPacketConn.WriteTo(buffer.Bytes(), c.bindAddr.UDPAddr())
+func (c *PacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	return bufio.WritePacketBuffer(c, buf.As(p), M.SocksaddrFromNet(addr))
 }
 
 func (c *PacketConn) ReadPacket(buffer *buf.Buffer) (destination M.Socksaddr, err error) {
@@ -87,11 +78,13 @@ func (c *PacketConn) ReadPacket(buffer *buf.Buffer) (destination M.Socksaddr, er
 
 func (c *PacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
 	if destination.IsFqdn() {
+		buffer.Release()
 		return E.Extend(ErrFqdnUnsupported, destination.Fqdn)
 	}
 	header := buf.With(buffer.ExtendHeader(AddressSerializer.AddrPortLen(destination)))
-	err := AddressSerializer.WriteAddrPort(header, destination)
+	err := AddressSerializer.WriteAddrPortBuffer(header, destination)
 	if err != nil {
+		buffer.Release()
 		return err
 	}
 	return c.NetPacketConn.WritePacket(buffer, c.bindAddr)

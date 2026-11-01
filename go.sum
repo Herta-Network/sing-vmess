@@ -1,5 +1,5 @@
-github.com/Herta-Network/sing v0.0.0-20261101103341-a402b0b490ba h1:vAXE63qsaFJD4GAfa3l+6ChMuPHiqHp19ScWTYgozqM=
-github.com/Herta-Network/sing v0.0.0-20261101103341-a402b0b490ba/go.mod h1:ynXUNwUt4dfOFO805EWzw3ORmNWXoexziwn5XYCfsq8=
+github.com/Herta-Network/sing v0.0.0-20261101142927-1d1b6994cf4a h1:2MdsyCoPHbaumY1aaifLVbL7srBsxX3p5GVcu1FwlEA=
+github.com/Herta-Network/sing v0.0.0-20261101142927-1d1b6994cf4a/go.mod h1:ynXUNwUt4dfOFO805EWzw3ORmNWXoexziwn5XYCfsq8=
 github.com/gofrs/uuid/v5 v5.3.2 h1:2jfO8j3XgSwlz/wHqemAEugfnTlikAYHhnqQ8Xh4fE0=
 github.com/gofrs/uuid/v5 v5.3.2/go.mod h1:CDOjlDMVAtN56jqyRUZh58JT31Tiw7/oQyEXZV+9bD8=
 github.com/stretchr/testify v1.12.1 h1:EuwCh5fleGS7H32xRwO3wRGT7DxrDhLAT6FF8MpWDWE=
